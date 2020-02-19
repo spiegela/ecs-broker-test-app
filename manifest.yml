@@ -1,0 +1,5 @@
+---
+applications:
+  - name: ecs-broker-test-app
+    services:
+      - ecs-broker-test-bucket
