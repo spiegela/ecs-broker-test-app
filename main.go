@@ -37,7 +37,7 @@ const fullControlACL = `<?xml version="1.0" encoding="UTF-8"?>
 
 var (
 	s3Client *s3.S3
-	bucket string
+	bucket   string
 )
 
 func main() {
@@ -87,20 +87,19 @@ func handler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-
 func generateS3Client() (*s3.S3, string, error) {
 	vcapServices := os.Getenv(vcapServicesVar)
-	var services map[string][]map[string]interface{}
+	services := bindingLookup{}
 	err := json.Unmarshal([]byte(vcapServices), &services)
 	if err != nil {
 		return nil, "", err
 	}
+
 	bucketServices, bucketServiceDefined := services["ecs-bucket"]
 	namespaceServices, namespaceServiceDefined := services["ecs-namespace"]
 	fileBucketServices, fileBucketServiceDefined := services["ecs-file-bucket"]
 
-	var serviceList []map[string]interface{}
-
+	var serviceList []serviceBinding
 	switch {
 	case bucketServiceDefined:
 		serviceList = bucketServices
@@ -112,18 +111,17 @@ func generateS3Client() (*s3.S3, string, error) {
 	if len(serviceList) == 0 {
 		return nil, "", fmt.Errorf("no services defined for service definiton: %v", serviceList)
 	}
-	vcapCredentials := serviceList[0]
-	endpoint, sess, err := createSessionFromCredentials(vcapCredentials)
+	binding := serviceList[0]
+	endpoint, sess, err := createSessionFromCredentials(binding.Credentials)
 	if err != nil {
 		return nil, "", err
 	}
 	forcePathStyle := true
 	svc := s3.New(sess, &aws.Config{Endpoint: &endpoint, S3ForcePathStyle: &forcePathStyle})
-	if vcapBucket, ok := vcapCredentials["bucket"]; ok {
-		bucket = vcapBucket.(string)
-	} else {
+	bucket = binding.Credentials.Bucket
+	if bucket == "" {
 		bucket = "test-bucket"
-		acl, err := generateFullControlACL(vcapCredentials["accessKey"].(string))
+		acl, err := generateFullControlACL(binding.Credentials.AccessKey)
 		if err != nil {
 			return nil, "", err
 		}
@@ -138,21 +136,20 @@ func generateS3Client() (*s3.S3, string, error) {
 	return svc, bucket, nil
 }
 
-func createSessionFromCredentials(vcapCredentials map[string]interface{}) (string, *session.Session, error) {
-	endpoint := vcapCredentials["endpoint"].(string)
+func createSessionFromCredentials(serviceCredentials serviceCredentials) (string, *session.Session, error) {
 	sess, sessErr := session.NewSession(&aws.Config{
 		Region: aws.String("us-west-2"),
 		Credentials: credentials.NewStaticCredentials(
-			vcapCredentials["accessKey"].(string),
-			vcapCredentials["secretKey"].(string),
+			serviceCredentials.AccessKey,
+			serviceCredentials.SecretKey,
 			"TOKEN",
 		),
-		Endpoint: &endpoint,
+		Endpoint: &serviceCredentials.Endpoint,
 	})
 	if sessErr != nil {
 		return "", nil, sessErr
 	}
-	return endpoint, sess, nil
+	return serviceCredentials.Endpoint, sess, nil
 }
 
 func generateFullControlACL(accessKey string) (string, error) {
