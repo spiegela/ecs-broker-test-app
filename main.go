@@ -2,12 +2,12 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
-	"io/ioutil"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
+	"text/template"
 
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/credentials"
@@ -17,96 +17,128 @@ import (
 
 const vcapServicesVar = "VCAP_SERVICES"
 
+const fullControlACL = `<?xml version="1.0" encoding="UTF-8"?>
+<AccessControlPolicy xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Owner>
+    <ID>{access_key}</ID>
+    <DisplayName>owner-display-name</DisplayName>
+  </Owner>
+  <AccessControlList>
+    <Grant>
+      <Grantee xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" 
+               xsi:type="Canonical User">
+        <ID>{access_key}</ID>
+        <DisplayName>{access_key}</DisplayName>
+      </Grantee>
+      <Permission>FULL_CONTROL</Permission>
+    </Grant>
+  </AccessControlList>
+</AccessControlPolicy>`
+
 var (
+	s3Client *s3.S3
 	bucket string
-	svc    *s3.S3
-	ctx    = context.Background()
 )
 
-func handler(w http.ResponseWriter, r *http.Request) {
-	key := r.URL.Path[1:]
+func main() {
+	svc, bucketName, err := generateS3Client()
+	if err != nil {
+		log.Fatal(err)
+	}
+	s3Client = svc
+	bucket = bucketName
+	http.HandleFunc("/", handler)
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
 
+func handler(w http.ResponseWriter, r *http.Request) {
+	var (
+		key  = r.URL.Path[1:]
+		err  error
+		resp []byte
+	)
+	asFile := r.URL.Query().Get("file")
+	var wr writer
+	if asFile != "" {
+		wr = NewFileWriter(bucket)
+	} else {
+		wr = NewS3Writer(bucket, s3Client)
+	}
 	switch r.Method {
 	case http.MethodPut, http.MethodPost:
-		body, readErr := ioutil.ReadAll(r.Body)
-		if readErr != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			_, writeRespErr := w.Write([]byte(readErr.Error()))
-			log.Fatal(writeRespErr)
-		}
-		resp, s3Err := svc.PutObjectWithContext(ctx, &s3.PutObjectInput{
-			Bucket: aws.String(bucket),
-			Key:    aws.String(key),
-			Body:   bytes.NewReader(body),
-		})
-		if s3Err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			_, writeRespErr := w.Write([]byte(s3Err.Error()))
-			if writeRespErr != nil{
-				log.Fatal(writeRespErr)
-			}
-			return
-		}
-		_, writeRespErr := w.Write([]byte(resp.String()))
-		if writeRespErr != nil {
-			log.Fatal(writeRespErr)
-		}
+		resp, err = wr.Write(r, key)
 	case http.MethodGet:
-		s3Resp, s3Err := svc.GetObjectWithContext(ctx, &s3.GetObjectInput{
-			Bucket: aws.String(bucket),
-			Key:    aws.String(key),
-		})
-		if s3Err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			_, writeRespErr := w.Write([]byte(s3Err.Error()))
-			if writeRespErr != nil {
-				log.Fatal(writeRespErr)
-			}
-			return
-		}
-		content, readErr := ioutil.ReadAll(s3Resp.Body)
-		if readErr != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			_, writeRespErr := w.Write([]byte(readErr.Error()))
-			if writeRespErr != nil {
-				log.Fatal(writeRespErr)
-			}
-		}
-		_, writeRespErr := w.Write(content)
-		if writeRespErr != nil {
-			log.Fatal(writeRespErr)
-		}
+		resp, err = wr.Read(key)
 	case http.MethodDelete:
-		resp, s3Err := svc.DeleteObjectWithContext(ctx, &s3.DeleteObjectInput{
-			Bucket: aws.String(bucket),
-			Key:    aws.String(key),
-		})
-		if s3Err != nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			_, writeRespErr := w.Write([]byte(s3Err.Error()))
-			log.Fatal(writeRespErr)
-			return
-		}
-		_, writeRespErr := w.Write([]byte(resp.String()))
-		if writeRespErr != nil {
-			log.Fatal(writeRespErr)
-		}
+		resp, err = wr.Delete(key)
 	default:
 		w.WriteHeader(http.StatusMethodNotAllowed)
 	}
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, writeRespErr := w.Write([]byte(err.Error()))
+		if writeRespErr != nil {
+			log.Fatal(writeRespErr)
+		}
+	}
+	_, writeRespErr := w.Write(resp)
+	if writeRespErr != nil {
+		log.Fatal(writeRespErr)
+	}
 }
 
-func main() {
+
+func generateS3Client() (*s3.S3, string, error) {
 	vcapServices := os.Getenv(vcapServicesVar)
 	var services map[string][]map[string]interface{}
 	err := json.Unmarshal([]byte(vcapServices), &services)
 	if err != nil {
-		log.Fatal(err)
+		return nil, "", err
 	}
-	vcapCredentials := services["ecs-bucket"][0]["credentials"].(map[string]interface{})
-	if len(services["ecs-bucket"]) == 0 {
-		log.Fatalf("No bucket bound: %v", vcapServices)
+	bucketServices, bucketServiceDefined := services["ecs-bucket"]
+	namespaceServices, namespaceServiceDefined := services["ecs-namespace"]
+	fileBucketServices, fileBucketServiceDefined := services["ecs-file-bucket"]
+
+	var serviceList []map[string]interface{}
+
+	switch {
+	case bucketServiceDefined:
+		serviceList = bucketServices
+	case namespaceServiceDefined:
+		serviceList = namespaceServices
+	case fileBucketServiceDefined:
+		serviceList = fileBucketServices
 	}
+	if len(serviceList) == 0 {
+		return nil, "", fmt.Errorf("no services defined for service definiton: %v", serviceList)
+	}
+	vcapCredentials := serviceList[0]
+	endpoint, sess, err := createSessionFromCredentials(vcapCredentials)
+	if err != nil {
+		return nil, "", err
+	}
+	forcePathStyle := true
+	svc := s3.New(sess, &aws.Config{Endpoint: &endpoint, S3ForcePathStyle: &forcePathStyle})
+	if vcapBucket, ok := vcapCredentials["bucket"]; ok {
+		bucket = vcapBucket.(string)
+	} else {
+		bucket = "test-bucket"
+		acl, err := generateFullControlACL(vcapCredentials["accessKey"].(string))
+		if err != nil {
+			return nil, "", err
+		}
+		_, err = svc.CreateBucket(&s3.CreateBucketInput{
+			Bucket: &bucket,
+			ACL:    &acl,
+		})
+		if err != nil {
+			return nil, "", err
+		}
+	}
+	return svc, bucket, nil
+}
+
+func createSessionFromCredentials(vcapCredentials map[string]interface{}) (string, *session.Session, error) {
 	endpoint := vcapCredentials["endpoint"].(string)
 	sess, sessErr := session.NewSession(&aws.Config{
 		Region: aws.String("us-west-2"),
@@ -118,11 +150,22 @@ func main() {
 		Endpoint: &endpoint,
 	})
 	if sessErr != nil {
-		log.Fatal(sessErr)
+		return "", nil, sessErr
 	}
-	forcePathStyle := true
-	svc = s3.New(sess, &aws.Config{Endpoint: &endpoint, S3ForcePathStyle: &forcePathStyle})
-	bucket = vcapCredentials["bucket"].(string)
-	http.HandleFunc("/", handler)
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	return endpoint, sess, nil
+}
+
+func generateFullControlACL(accessKey string) (string, error) {
+	var out bytes.Buffer
+	tmpl, err := template.New("fullControlACL").Parse(fullControlACL)
+	if err != nil {
+		return "", err
+	}
+	err = tmpl.Execute(&out, struct{ accessKey string }{
+		accessKey: accessKey,
+	})
+	if err != nil {
+		return "", err
+	}
+	return out.String(), nil
 }
